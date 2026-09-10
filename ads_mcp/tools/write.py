@@ -1,8 +1,7 @@
 """Ferramentas de escrita (mutate) para o fork do Google Ads MCP.
 
-Todas as ferramentas rodam em dry_run=True por padrão: a API valida a
-operação (validate_only) sem aplicar nada. Só executa de verdade quando
-o agente chama novamente com dry_run=False, depois da aprovação humana.
+As ferramentas executam as alterações imediatamente. A aprovação humana
+antes de cada alteração é responsabilidade das instruções do agente.
 """
 
 import re
@@ -35,11 +34,8 @@ def _raise(ex: GoogleAdsException):
     raise ToolError(f"Request ID: {ex.request_id}\n" + "\n".join(msgs))
 
 
-def _log(tool: str, customer_id: str, dry_run: bool, detail: Dict[str, Any]):
-    utils.logger.info(
-        f"ads_mcp.write {tool} customer={customer_id} "
-        f"dry_run={dry_run} {detail}"
-    )
+def _log(tool: str, customer_id: str, detail: Dict[str, Any]):
+    utils.logger.info(f"ads_mcp.write {tool} customer={customer_id} {detail}")
 
 
 def _send(mutate_fn, req):
@@ -49,10 +45,9 @@ def _send(mutate_fn, req):
         _raise(ex)
 
 
-def _request(client, type_name: str, customer_id: str, dry_run: bool):
+def _request(client, type_name: str, customer_id: str):
     req = client.get_type(type_name)
     req.customer_id = customer_id
-    req.validate_only = dry_run
     req.partial_failure = False
     return req
 
@@ -68,9 +63,9 @@ def _clean_keywords(keywords: List[str]) -> List[str]:
     return cleaned
 
 
-def _result(tool, customer_id, dry_run, detail):
-    _log(tool, customer_id, dry_run, detail)
-    return {"dry_run": dry_run, "applied": not dry_run, **detail}
+def _result(tool, customer_id, detail):
+    _log(tool, customer_id, detail)
+    return {"applied": True, **detail}
 
 
 # ---------------------------------------------------------------- campanhas
@@ -81,12 +76,9 @@ def set_campaign_status(
     customer_id: str,
     campaign_id: str,
     status: Literal["PAUSED", "ENABLED"],
-    dry_run: bool = True,
 ) -> Dict[str, Any]:
     """Pausa ou ativa uma campanha.
 
-    Sempre chame primeiro com dry_run=True e peça aprovação ao usuário
-    antes de repetir a chamada com dry_run=False.
     """
     customer_id = utils.clean_customer_id(customer_id)
     client = utils.get_googleads_client()
@@ -100,12 +92,12 @@ def set_campaign_status(
         op.update_mask, protobuf_helpers.field_mask(None, campaign._pb)
     )
 
-    req = _request(client, "MutateCampaignsRequest", customer_id, dry_run)
+    req = _request(client, "MutateCampaignsRequest", customer_id)
     req.operations.append(op)
     _send(svc.mutate_campaigns, req)
 
     return _result(
-        "set_campaign_status", customer_id, dry_run,
+        "set_campaign_status", customer_id,
         {"campaign_id": campaign_id, "new_status": status},
     )
 
@@ -116,13 +108,11 @@ def update_campaign_budget(
     campaign_id: str,
     new_daily_budget: float,
     max_change_pct: float = 30.0,
-    dry_run: bool = True,
 ) -> Dict[str, Any]:
     """Altera o orçamento diário de uma campanha (valor na moeda da conta).
 
     Recusa variações acima de max_change_pct em relação ao orçamento atual
     e orçamentos compartilhados (afetariam outras campanhas).
-    Sempre chame primeiro com dry_run=True.
     """
     customer_id = utils.clean_customer_id(customer_id)
     client = utils.get_googleads_client()
@@ -159,12 +149,12 @@ def update_campaign_budget(
     budget.amount_micros = int(round(new_daily_budget * 1_000_000))
     client.copy_from(op.update_mask, protobuf_helpers.field_mask(None, budget._pb))
 
-    req = _request(client, "MutateCampaignBudgetsRequest", customer_id, dry_run)
+    req = _request(client, "MutateCampaignBudgetsRequest", customer_id)
     req.operations.append(op)
     _send(svc.mutate_campaign_budgets, req)
 
     return _result(
-        "update_campaign_budget", customer_id, dry_run,
+        "update_campaign_budget", customer_id,
         {
             "campaign_id": campaign_id,
             "budget_before": current,
@@ -183,12 +173,11 @@ def add_campaign_negative_keywords(
     campaign_id: str,
     keywords: List[str],
     match_type: MatchType = "PHRASE",
-    dry_run: bool = True,
 ) -> Dict[str, Any]:
     """Adiciona palavras-chave negativas no nível da CAMPANHA.
 
     Cada palavra consome 1 operação da cota diária. Máximo de 200 por
-    chamada. Sempre chame primeiro com dry_run=True.
+    chamada.
     """
     keywords = _clean_keywords(keywords)
     if len(keywords) > _MAX_KEYWORDS:
@@ -199,7 +188,7 @@ def add_campaign_negative_keywords(
     svc = _service(client, "CampaignCriterionService")
     campaign_rn = svc.campaign_path(customer_id, campaign_id)
 
-    req = _request(client, "MutateCampaignCriteriaRequest", customer_id, dry_run)
+    req = _request(client, "MutateCampaignCriteriaRequest", customer_id)
     for text in keywords:
         op = client.get_type("CampaignCriterionOperation")
         crit = op.create
@@ -211,7 +200,7 @@ def add_campaign_negative_keywords(
     _send(svc.mutate_campaign_criteria, req)
 
     return _result(
-        "add_campaign_negative_keywords", customer_id, dry_run,
+        "add_campaign_negative_keywords", customer_id,
         {
             "campaign_id": campaign_id,
             "match_type": match_type,
@@ -227,14 +216,12 @@ def add_ad_group_negative_keywords(
     ad_group_id: str,
     keywords: List[str],
     match_types: List[MatchType] = ["PHRASE", "EXACT"],
-    dry_run: bool = True,
 ) -> Dict[str, Any]:
     """Adiciona palavras-chave negativas no nível do GRUPO DE ANÚNCIOS.
 
     Por padrão cria cada termo em Frase E Exata (2 negativas por termo).
     Cada negativa criada consome 1 operação da cota diária (termos x
     tipos de correspondência). Máximo de 200 negativas por chamada.
-    Sempre chame primeiro com dry_run=True.
     """
     keywords = _clean_keywords(keywords)
     match_types = list(dict.fromkeys(match_types))
@@ -252,7 +239,7 @@ def add_ad_group_negative_keywords(
     svc = _service(client, "AdGroupCriterionService")
     ad_group_rn = svc.ad_group_path(customer_id, ad_group_id)
 
-    req = _request(client, "MutateAdGroupCriteriaRequest", customer_id, dry_run)
+    req = _request(client, "MutateAdGroupCriteriaRequest", customer_id)
     for text in keywords:
         for mt in match_types:
             op = client.get_type("AdGroupCriterionOperation")
@@ -265,7 +252,7 @@ def add_ad_group_negative_keywords(
     _send(svc.mutate_ad_group_criteria, req)
 
     return _result(
-        "add_ad_group_negative_keywords", customer_id, dry_run,
+        "add_ad_group_negative_keywords", customer_id,
         {
             "ad_group_id": ad_group_id,
             "match_types": match_types,
@@ -283,13 +270,12 @@ def add_ad_group_keywords(
     keywords: List[str],
     match_type: MatchType = "PHRASE",
     cpc_bid: float | None = None,
-    dry_run: bool = True,
 ) -> Dict[str, Any]:
     """Adiciona palavras-chave POSITIVAS (ativas) a um grupo de anúncios.
 
     cpc_bid é opcional (moeda da conta); deixe vazio em campanhas com
     lance automático. Cada palavra consome 1 operação. Máximo de 200 por
-    chamada. Sempre chame primeiro com dry_run=True.
+    chamada.
     """
     keywords = _clean_keywords(keywords)
     if len(keywords) > _MAX_KEYWORDS:
@@ -300,7 +286,7 @@ def add_ad_group_keywords(
     svc = _service(client, "AdGroupCriterionService")
     ad_group_rn = svc.ad_group_path(customer_id, ad_group_id)
 
-    req = _request(client, "MutateAdGroupCriteriaRequest", customer_id, dry_run)
+    req = _request(client, "MutateAdGroupCriteriaRequest", customer_id)
     for text in keywords:
         op = client.get_type("AdGroupCriterionOperation")
         crit = op.create
@@ -314,7 +300,7 @@ def add_ad_group_keywords(
     _send(svc.mutate_ad_group_criteria, req)
 
     return _result(
-        "add_ad_group_keywords", customer_id, dry_run,
+        "add_ad_group_keywords", customer_id,
         {
             "ad_group_id": ad_group_id,
             "match_type": match_type,
@@ -331,7 +317,6 @@ def remove_keywords(
     level: Literal["campaign", "ad_group"],
     parent_id: str,
     criterion_ids: List[str],
-    dry_run: bool = True,
 ) -> Dict[str, Any]:
     """Remove palavras-chave (positivas ou negativas) de uma campanha ou
     grupo de anúncios.
@@ -340,8 +325,7 @@ def remove_keywords(
     (parent_id = id do grupo). Os criterion_ids vêm de uma consulta em
     campaign_criterion ou ad_group_criterion. Só remove critérios do tipo
     KEYWORD; recusa qualquer outro (localização, público etc.).
-    Remoção não pode ser desfeita (só recriando). Sempre chame primeiro
-    com dry_run=True e mostre ao usuário a lista de textos retornada.
+    Remoção não pode ser desfeita (só recriando).
     """
     ids = list(dict.fromkeys(str(int(i)) for i in criterion_ids))
     if not ids:
@@ -381,7 +365,7 @@ def remove_keywords(
 
     if level == "campaign":
         svc = _service(client, "CampaignCriterionService")
-        req = _request(client, "MutateCampaignCriteriaRequest", customer_id, dry_run)
+        req = _request(client, "MutateCampaignCriteriaRequest", customer_id)
         for i in ids:
             op = client.get_type("CampaignCriterionOperation")
             op.remove = svc.campaign_criterion_path(customer_id, parent_id, i)
@@ -389,7 +373,7 @@ def remove_keywords(
         _send(svc.mutate_campaign_criteria, req)
     else:
         svc = _service(client, "AdGroupCriterionService")
-        req = _request(client, "MutateAdGroupCriteriaRequest", customer_id, dry_run)
+        req = _request(client, "MutateAdGroupCriteriaRequest", customer_id)
         for i in ids:
             op = client.get_type("AdGroupCriterionOperation")
             op.remove = svc.ad_group_criterion_path(customer_id, parent_id, i)
@@ -406,7 +390,7 @@ def remove_keywords(
         for i in ids
     ]
     return _result(
-        "remove_keywords", customer_id, dry_run,
+        "remove_keywords", customer_id,
         {"level": level, "parent_id": parent_id, "count": len(ids), "removed": removed},
     )
 
@@ -423,7 +407,6 @@ def create_responsive_search_ad(
     final_url: str,
     path1: str = "",
     path2: str = "",
-    dry_run: bool = True,
 ) -> Dict[str, Any]:
     """Cria um anúncio responsivo de pesquisa (RSA), sempre PAUSADO.
 
@@ -431,7 +414,7 @@ def create_responsive_search_ad(
     descriptions: 2 a 4 descrições, até 90 caracteres cada.
     path1/path2: até 15 caracteres cada (path2 exige path1).
     Para "editar" um RSA: crie o novo com esta ferramenta e pause o antigo
-    com set_ad_status. Sempre chame primeiro com dry_run=True.
+    com set_ad_status.
     """
     headlines = [" ".join(h.split()) for h in headlines if h.strip()]
     descriptions = [" ".join(d.split()) for d in descriptions if d.strip()]
@@ -477,7 +460,7 @@ def create_responsive_search_ad(
     if path2:
         rsa.path2 = path2
 
-    req = _request(client, "MutateAdGroupAdsRequest", customer_id, dry_run)
+    req = _request(client, "MutateAdGroupAdsRequest", customer_id)
     req.operations.append(op)
     resp = _send(svc.mutate_ad_group_ads, req)
 
@@ -490,9 +473,9 @@ def create_responsive_search_ad(
         "path1": path1,
         "path2": path2,
     }
-    if not dry_run and resp and resp.results:
+    if resp and resp.results:
         detail["resource_name"] = resp.results[0].resource_name
-    return _result("create_responsive_search_ad", customer_id, dry_run, detail)
+    return _result("create_responsive_search_ad", customer_id, detail)
 
 
 @write_mcp.tool(annotations=_WRITE)
@@ -501,11 +484,9 @@ def set_ad_status(
     ad_group_id: str,
     ad_id: str,
     status: Literal["PAUSED", "ENABLED"],
-    dry_run: bool = True,
 ) -> Dict[str, Any]:
     """Pausa ou ativa um anúncio específico dentro de um grupo.
 
-    Sempre chame primeiro com dry_run=True.
     """
     customer_id = utils.clean_customer_id(customer_id)
     client = utils.get_googleads_client()
@@ -517,12 +498,12 @@ def set_ad_status(
     aga.status = client.enums.AdGroupAdStatusEnum[status]
     client.copy_from(op.update_mask, protobuf_helpers.field_mask(None, aga._pb))
 
-    req = _request(client, "MutateAdGroupAdsRequest", customer_id, dry_run)
+    req = _request(client, "MutateAdGroupAdsRequest", customer_id)
     req.operations.append(op)
     _send(svc.mutate_ad_group_ads, req)
 
     return _result(
-        "set_ad_status", customer_id, dry_run,
+        "set_ad_status", customer_id,
         {"ad_group_id": ad_group_id, "ad_id": ad_id, "new_status": status},
     )
 
@@ -590,7 +571,6 @@ def _snake(name: str) -> str:
 def mutate(
     customer_id: str,
     operations: List[Dict[str, Any]],
-    dry_run: bool = True,
     allow_structural_remove: bool = False,
 ) -> Dict[str, Any]:
     """Executa qualquer alteração via GoogleAdsService.Mutate (64 tipos de
@@ -618,7 +598,6 @@ def mutate(
     lista compartilhada, público, label ou experimento exige
     allow_structural_remove=True, que só deve ser usado depois de o
     usuário aprovar essa remoção especificamente.
-    Sempre chame primeiro com dry_run=True e mostre ao usuário o resumo.
     """
     if not operations:
         raise ToolError("Nenhuma operação informada.")
@@ -629,7 +608,7 @@ def mutate(
     client = utils.get_googleads_client()
     svc = _service(client, "GoogleAdsService")
 
-    req = _request(client, "MutateGoogleAdsRequest", customer_id, dry_run)
+    req = _request(client, "MutateGoogleAdsRequest", customer_id)
     summary: Dict[str, int] = {}
     for i, raw in enumerate(operations):
         op = client.get_type("MutateOperation")
@@ -666,14 +645,14 @@ def mutate(
     resp = _send(svc.mutate, req)
 
     detail: Dict[str, Any] = {"operations": len(operations), "summary": summary}
-    if not dry_run and resp is not None:
+    if resp is not None:
         names = []
         for r in resp.mutate_operation_responses:
             kind = r._pb.WhichOneof("response")
             if kind:
                 names.append(getattr(r, kind).resource_name)
         detail["resource_names"] = names
-    return _result("mutate", customer_id, dry_run, detail)
+    return _result("mutate", customer_id, detail)
 
 
 @write_mcp.tool(annotations=_WRITE)
@@ -682,7 +661,6 @@ def call_service(
     service: str,
     method: str,
     request: Dict[str, Any],
-    dry_run: bool = True,
 ) -> Dict[str, Any]:
     """Chama qualquer outro método da API do Google Ads que não seja coberto
     por mutate ou search. Exemplos: RecommendationService.ApplyRecommendation
@@ -695,11 +673,7 @@ def call_service(
     request: corpo da requisição em JSON (snake_case); customer_id é
     preenchido automaticamente quando o método aceita.
 
-    Métodos de consulta (Get, List, Search, Suggest, Generate) rodam direto.
-    Métodos que alteram algo: com dry_run=True, a API valida sem aplicar
-    quando o método aceita validação; quando não aceita, nada é enviado e
-    a ferramenta devolve só a prévia da requisição. Sempre chame primeiro
-    com dry_run=True e peça aprovação antes de dry_run=False.
+    Métodos que alteram algo executam imediatamente.
     """
     service = _camel(service.removesuffix("Service")) + "Service"
     method_camel = _camel(method)
@@ -733,19 +707,8 @@ def call_service(
     is_read = method_camel.startswith(_READ_PREFIXES)
     detail: Dict[str, Any] = {"service": service, "method": method_camel}
 
-    if not is_read and dry_run:
-        if "validate_only" in fields:
-            req.validate_only = True
-        else:
-            detail["sent"] = False
-            detail["request_preview"] = _to_dict(req)
-            detail["note"] = "Método sem validação prévia: nada foi enviado."
-            return _result("call_service", customer_id, True, detail)
-
     resp = _send(fn, req)
-    detail["sent"] = True
     if resp is not None and hasattr(resp, "_pb"):
         detail["response"] = _to_dict(resp)
-    effective_dry = dry_run and not is_read
-    _log("call_service", customer_id, effective_dry, detail)
-    return {"dry_run": effective_dry, "applied": not effective_dry and not is_read, **detail}
+    _log("call_service", customer_id, detail)
+    return {"applied": not is_read, **detail}
